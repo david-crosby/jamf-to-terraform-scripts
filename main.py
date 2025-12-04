@@ -57,11 +57,21 @@ def get_jamf_token(instance_url, client_id, client_secret):
 
         if response.status_code != 200:
             logger.error(f'Authentication failed with status code: {response.status_code}')
-            logger.debug(f'Response body: {response.text}')
+            # Don't log response body for auth endpoints to avoid exposing credentials
             raise Exception(f'Authentication failed: {response.status_code}')
 
+        try:
+            data = response.json()
+        except ValueError as e:
+            logger.error(f'Failed to parse authentication response as JSON: {e}')
+            raise Exception('Invalid JSON response from authentication endpoint')
+
+        if 'access_token' not in data:
+            logger.error('Authentication response missing access_token field')
+            raise Exception('Invalid authentication response: missing access_token')
+
         logger.info('Successfully authenticated to Jamf Pro')
-        return response.json()['access_token']
+        return data['access_token']
     except requests.Timeout:
         logger.error(f'Authentication request timed out after {REQUEST_TIMEOUT} seconds')
         raise
@@ -81,10 +91,20 @@ def get_cloud_idps(instance_url, token):
 
         if response.status_code != 200:
             logger.error(f'Failed to fetch cloud IDPs: {response.status_code}')
-            logger.debug(f'Response body: {response.text}')
+            logger.debug(f'Response body: {response.text[:500]}')  # Log only first 500 chars
             raise Exception(f'Failed to fetch cloud IDPs: {response.status_code}')
 
-        results = response.json().get('results', [])
+        try:
+            data = response.json()
+        except ValueError as e:
+            logger.error(f'Failed to parse cloud IDPs response as JSON: {e}')
+            raise Exception('Invalid JSON response from cloud IDPs endpoint')
+
+        if not isinstance(data, dict):
+            logger.error(f'Unexpected response format for cloud IDPs: expected dict, got {type(data).__name__}')
+            raise Exception('Invalid cloud IDPs response format')
+
+        results = data.get('results', [])
         logger.debug(f'Retrieved {len(results)} cloud identity provider(s)')
         return results
     except requests.Timeout:
@@ -106,10 +126,20 @@ def get_static_computer_groups(instance_url, token):
 
         if response.status_code != 200:
             logger.error(f'Failed to fetch static computer groups: {response.status_code}')
-            logger.debug(f'Response body: {response.text}')
+            logger.debug(f'Response body: {response.text[:500]}')  # Log only first 500 chars
             raise Exception(f'Failed to fetch static computer groups: {response.status_code}')
 
-        results = response.json().get('results', [])
+        try:
+            data = response.json()
+        except ValueError as e:
+            logger.error(f'Failed to parse static computer groups response as JSON: {e}')
+            raise Exception('Invalid JSON response from static computer groups endpoint')
+
+        if not isinstance(data, dict):
+            logger.error(f'Unexpected response format for static computer groups: expected dict, got {type(data).__name__}')
+            raise Exception('Invalid static computer groups response format')
+
+        results = data.get('results', [])
         logger.debug(f'Retrieved {len(results)} static computer group(s)')
         return results
     except requests.Timeout:
@@ -131,10 +161,20 @@ def get_smart_computer_groups(instance_url, token):
 
         if response.status_code != 200:
             logger.error(f'Failed to fetch smart computer groups: {response.status_code}')
-            logger.debug(f'Response body: {response.text}')
+            logger.debug(f'Response body: {response.text[:500]}')  # Log only first 500 chars
             raise Exception(f'Failed to fetch smart computer groups: {response.status_code}')
 
-        results = response.json().get('results', [])
+        try:
+            data = response.json()
+        except ValueError as e:
+            logger.error(f'Failed to parse smart computer groups response as JSON: {e}')
+            raise Exception('Invalid JSON response from smart computer groups endpoint')
+
+        if not isinstance(data, dict):
+            logger.error(f'Unexpected response format for smart computer groups: expected dict, got {type(data).__name__}')
+            raise Exception('Invalid smart computer groups response format')
+
+        results = data.get('results', [])
         logger.debug(f'Retrieved {len(results)} smart computer group(s)')
         return results
     except requests.Timeout:
@@ -156,10 +196,20 @@ def get_extension_attributes(instance_url, token):
 
         if response.status_code != 200:
             logger.error(f'Failed to fetch extension attributes: {response.status_code}')
-            logger.debug(f'Response body: {response.text}')
+            logger.debug(f'Response body: {response.text[:500]}')  # Log only first 500 chars
             raise Exception(f'Failed to fetch extension attributes: {response.status_code}')
 
-        results = response.json().get('results', [])
+        try:
+            data = response.json()
+        except ValueError as e:
+            logger.error(f'Failed to parse extension attributes response as JSON: {e}')
+            raise Exception('Invalid JSON response from extension attributes endpoint')
+
+        if not isinstance(data, dict):
+            logger.error(f'Unexpected response format for extension attributes: expected dict, got {type(data).__name__}')
+            raise Exception('Invalid extension attributes response format')
+
+        results = data.get('results', [])
         logger.debug(f'Retrieved {len(results)} extension attribute(s)')
         return results
     except requests.Timeout:
@@ -181,10 +231,20 @@ def get_scripts(instance_url, token):
 
         if response.status_code != 200:
             logger.error(f'Failed to fetch scripts: {response.status_code}')
-            logger.debug(f'Response body: {response.text}')
+            logger.debug(f'Response body: {response.text[:500]}')  # Log only first 500 chars
             raise Exception(f'Failed to fetch scripts: {response.status_code}')
 
-        results = response.json().get('results', [])
+        try:
+            data = response.json()
+        except ValueError as e:
+            logger.error(f'Failed to parse scripts response as JSON: {e}')
+            raise Exception('Invalid JSON response from scripts endpoint')
+
+        if not isinstance(data, dict):
+            logger.error(f'Unexpected response format for scripts: expected dict, got {type(data).__name__}')
+            raise Exception('Invalid scripts response format')
+
+        results = data.get('results', [])
         logger.debug(f'Retrieved {len(results)} script(s)')
         return results
     except requests.Timeout:
@@ -208,7 +268,13 @@ def get_extension_attribute_details(instance_url, token, ea_id):
             logger.warning(f'Failed to fetch extension attribute {ea_id} details: {response.status_code}')
             return None
 
-        return response.json()
+        try:
+            data = response.json()
+        except ValueError as e:
+            logger.warning(f'Failed to parse extension attribute {ea_id} details as JSON: {e}')
+            return None
+
+        return data
     except requests.Timeout:
         logger.warning(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching extension attribute {ea_id} details')
         return None
@@ -230,7 +296,13 @@ def get_script_details(instance_url, token, script_id):
             logger.warning(f'Failed to fetch script {script_id} details: {response.status_code}')
             return None
 
-        return response.json()
+        try:
+            data = response.json()
+        except ValueError as e:
+            logger.warning(f'Failed to parse script {script_id} details as JSON: {e}')
+            return None
+
+        return data
     except requests.Timeout:
         logger.warning(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching script {script_id} details')
         return None
