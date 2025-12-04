@@ -5,28 +5,28 @@ import logging
 import os
 import re
 import sys
+import time
+from typing import Optional, Dict, List, Any
 
 import requests
 
-# Request timeout in seconds
 REQUEST_TIMEOUT = 30
+MIN_REQUEST_INTERVAL = 0.1
+last_request_time = 0
 
 
 def setup_logger(log_file='jamf_export.log', console_level=logging.INFO, file_level=logging.DEBUG):
     logger = logging.getLogger('jamf_exporter')
     logger.setLevel(logging.DEBUG)
 
-    # Prevent duplicate handlers if logger is reinitialized
     if logger.handlers:
         return logger
 
-    # Console handler - INFO and above
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(console_level)
     console_formatter = logging.Formatter('%(message)s')
     console_handler.setFormatter(console_formatter)
 
-    # File handler - DEBUG and above
     file_handler = logging.FileHandler(log_file, mode='a')
     file_handler.setLevel(file_level)
     file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -41,7 +41,113 @@ def setup_logger(log_file='jamf_export.log', console_level=logging.INFO, file_le
 logger = setup_logger()
 
 
-def get_jamf_token(instance_url, client_id, client_secret):
+RESOURCE_CONFIGS = {
+    'cloud_idp': {
+        'endpoint': 'api/v1/cloud-idp',
+        'display_name': 'cloud identity provider',
+        'terraform_resource': 'jamfpro_cloud_identity_provider',
+        'name_field': 'displayName',
+        'output_file': 'idp_imports.tf',
+        'header': 'Jamf Pro Cloud Identity Provider Import Blocks',
+    },
+    'static_groups': {
+        'endpoint': 'api/v2/computer-groups/static-groups',
+        'display_name': 'static computer group',
+        'terraform_resource': 'jamfpro_static_computer_group',
+        'name_field': 'name',
+        'output_file': 'static_groups_imports.tf',
+        'header': 'Jamf Pro Static Computer Group Import Blocks',
+    },
+    'smart_groups': {
+        'endpoint': 'api/v2/computer-groups/smart-groups',
+        'display_name': 'smart computer group',
+        'terraform_resource': 'jamfpro_smart_computer_group',
+        'name_field': 'name',
+        'output_file': 'smart_groups_imports.tf',
+        'header': 'Jamf Pro Smart Computer Group Import Blocks',
+    },
+    'extension_attributes': {
+        'endpoint': 'api/v1/computer-extension-attributes',
+        'display_name': 'extension attribute',
+        'terraform_resource': 'jamfpro_computer_extension_attribute',
+        'name_field': 'name',
+        'output_file': 'extension_attributes_imports.tf',
+        'header': 'Jamf Pro Computer Extension Attribute Import Blocks',
+        'details_endpoint': 'api/v1/computer-extension-attributes/{id}',
+        'has_scope': True,
+        'scope_path': 'inventoryDisplay',
+    },
+    'scripts': {
+        'endpoint': 'api/v1/scripts',
+        'display_name': 'script',
+        'terraform_resource': 'jamfpro_script',
+        'name_field': 'name',
+        'output_file': 'scripts_imports.tf',
+        'header': 'Jamf Pro Script Import Blocks',
+        'details_endpoint': 'api/v1/scripts/{id}',
+        'has_scope': True,
+        'scope_path': None,
+    },
+}
+
+
+class FailureTracker:
+    """Tracks partial failures during resource processing"""
+
+    def __init__(self):
+        self.failures: Dict[str, List[Dict[str, Any]]] = {}
+
+    def add_failure(self, resource_type: str, resource_id: str, resource_name: str, error: str):
+        """Record a failed resource operation"""
+        if resource_type not in self.failures:
+            self.failures[resource_type] = []
+
+        self.failures[resource_type].append({
+            'id': resource_id,
+            'name': resource_name,
+            'error': error
+        })
+
+    def has_failures(self) -> bool:
+        """Check if any failures were recorded"""
+        return len(self.failures) > 0
+
+    def get_summary(self) -> str:
+        """Get a formatted summary of all failures"""
+        if not self.has_failures():
+            return "No failures recorded."
+
+        lines = ["\n" + "="*60, "PARTIAL FAILURE SUMMARY", "="*60]
+
+        total_failures = sum(len(items) for items in self.failures.values())
+        lines.append(f"\nTotal failed operations: {total_failures}")
+
+        for resource_type, failures in self.failures.items():
+            lines.append(f"\n{resource_type} ({len(failures)} failures):")
+            for failure in failures:
+                lines.append(f"  - {failure['name']} (ID: {failure['id']})")
+                lines.append(f"    Error: {failure['error']}")
+
+        lines.append("\n" + "="*60)
+        return "\n".join(lines)
+
+
+def rate_limit():
+    """Implement simple rate limiting between API requests"""
+    global last_request_time
+
+    current_time = time.time()
+    time_since_last_request = current_time - last_request_time
+
+    if time_since_last_request < MIN_REQUEST_INTERVAL:
+        sleep_time = MIN_REQUEST_INTERVAL - time_since_last_request
+        logger.debug(f'Rate limiting: sleeping for {sleep_time:.3f} seconds')
+        time.sleep(sleep_time)
+
+    last_request_time = time.time()
+
+
+def get_jamf_token(instance_url: str, client_id: str, client_secret: str) -> str:
     logger.debug(f'Attempting authentication to {instance_url}')
     try:
         response = requests.post(
@@ -57,7 +163,6 @@ def get_jamf_token(instance_url, client_id, client_secret):
 
         if response.status_code != 200:
             logger.error(f'Authentication failed with status code: {response.status_code}')
-            # Don't log response body for auth endpoints to avoid exposing credentials
             raise Exception(f'Authentication failed: {response.status_code}')
 
         try:
@@ -80,234 +185,85 @@ def get_jamf_token(instance_url, client_id, client_secret):
         raise
 
 
-def get_cloud_idps(instance_url, token):
-    logger.debug('Fetching cloud identity providers')
+def fetch_api_resources(instance_url: str, token: str, endpoint: str, resource_name: str) -> List[Dict]:
+    """Generic function to fetch API resources with consistent error handling"""
+    logger.debug(f'Fetching {resource_name}')
+
+    rate_limit()
+
     try:
         response = requests.get(
-            f'{instance_url}/api/v1/cloud-idp',
+            f'{instance_url}/{endpoint}',
             headers={'Authorization': f'Bearer {token}'},
             timeout=REQUEST_TIMEOUT
         )
 
         if response.status_code != 200:
-            logger.error(f'Failed to fetch cloud IDPs: {response.status_code}')
-            logger.debug(f'Response body: {response.text[:500]}')  # Log only first 500 chars
-            raise Exception(f'Failed to fetch cloud IDPs: {response.status_code}')
+            logger.error(f'Failed to fetch {resource_name}: {response.status_code}')
+            logger.debug(f'Response body: {response.text[:500]}')
+            raise Exception(f'Failed to fetch {resource_name}: {response.status_code}')
 
         try:
             data = response.json()
         except ValueError as e:
-            logger.error(f'Failed to parse cloud IDPs response as JSON: {e}')
-            raise Exception('Invalid JSON response from cloud IDPs endpoint')
+            logger.error(f'Failed to parse {resource_name} response as JSON: {e}')
+            raise Exception(f'Invalid JSON response from {resource_name} endpoint')
 
         if not isinstance(data, dict):
-            logger.error(f'Unexpected response format for cloud IDPs: expected dict, got {type(data).__name__}')
-            raise Exception('Invalid cloud IDPs response format')
+            logger.error(f'Unexpected response format for {resource_name}: expected dict, got {type(data).__name__}')
+            raise Exception(f'Invalid {resource_name} response format')
 
         results = data.get('results', [])
-        logger.debug(f'Retrieved {len(results)} cloud identity provider(s)')
+        logger.debug(f'Retrieved {len(results)} {resource_name}(s)')
         return results
+
     except requests.Timeout:
-        logger.error(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching cloud IDPs')
+        logger.error(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching {resource_name}')
         raise
     except requests.RequestException as e:
-        logger.error(f'Network error fetching cloud IDPs: {e}')
+        logger.error(f'Network error fetching {resource_name}: {e}')
         raise
 
 
-def get_static_computer_groups(instance_url, token):
-    logger.debug('Fetching static computer groups')
+def fetch_resource_details(instance_url: str, token: str, endpoint: str, resource_id: str,
+                          resource_name: str, failure_tracker: FailureTracker) -> Optional[Dict]:
+    """Generic function to fetch individual resource details with failure tracking"""
+    logger.debug(f'Fetching details for {resource_name} ID: {resource_id}')
+
+    rate_limit()
+
     try:
         response = requests.get(
-            f'{instance_url}/api/v2/computer-groups/static-groups',
+            f'{instance_url}/{endpoint.format(id=resource_id)}',
             headers={'Authorization': f'Bearer {token}'},
             timeout=REQUEST_TIMEOUT
         )
 
         if response.status_code != 200:
-            logger.error(f'Failed to fetch static computer groups: {response.status_code}')
-            logger.debug(f'Response body: {response.text[:500]}')  # Log only first 500 chars
-            raise Exception(f'Failed to fetch static computer groups: {response.status_code}')
-
-        try:
-            data = response.json()
-        except ValueError as e:
-            logger.error(f'Failed to parse static computer groups response as JSON: {e}')
-            raise Exception('Invalid JSON response from static computer groups endpoint')
-
-        if not isinstance(data, dict):
-            logger.error(f'Unexpected response format for static computer groups: expected dict, got {type(data).__name__}')
-            raise Exception('Invalid static computer groups response format')
-
-        results = data.get('results', [])
-        logger.debug(f'Retrieved {len(results)} static computer group(s)')
-        return results
-    except requests.Timeout:
-        logger.error(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching static computer groups')
-        raise
-    except requests.RequestException as e:
-        logger.error(f'Network error fetching static computer groups: {e}')
-        raise
-
-
-def get_smart_computer_groups(instance_url, token):
-    logger.debug('Fetching smart computer groups')
-    try:
-        response = requests.get(
-            f'{instance_url}/api/v2/computer-groups/smart-groups',
-            headers={'Authorization': f'Bearer {token}'},
-            timeout=REQUEST_TIMEOUT
-        )
-
-        if response.status_code != 200:
-            logger.error(f'Failed to fetch smart computer groups: {response.status_code}')
-            logger.debug(f'Response body: {response.text[:500]}')  # Log only first 500 chars
-            raise Exception(f'Failed to fetch smart computer groups: {response.status_code}')
-
-        try:
-            data = response.json()
-        except ValueError as e:
-            logger.error(f'Failed to parse smart computer groups response as JSON: {e}')
-            raise Exception('Invalid JSON response from smart computer groups endpoint')
-
-        if not isinstance(data, dict):
-            logger.error(f'Unexpected response format for smart computer groups: expected dict, got {type(data).__name__}')
-            raise Exception('Invalid smart computer groups response format')
-
-        results = data.get('results', [])
-        logger.debug(f'Retrieved {len(results)} smart computer group(s)')
-        return results
-    except requests.Timeout:
-        logger.error(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching smart computer groups')
-        raise
-    except requests.RequestException as e:
-        logger.error(f'Network error fetching smart computer groups: {e}')
-        raise
-
-
-def get_extension_attributes(instance_url, token):
-    logger.debug('Fetching extension attributes')
-    try:
-        response = requests.get(
-            f'{instance_url}/api/v1/computer-extension-attributes',
-            headers={'Authorization': f'Bearer {token}'},
-            timeout=REQUEST_TIMEOUT
-        )
-
-        if response.status_code != 200:
-            logger.error(f'Failed to fetch extension attributes: {response.status_code}')
-            logger.debug(f'Response body: {response.text[:500]}')  # Log only first 500 chars
-            raise Exception(f'Failed to fetch extension attributes: {response.status_code}')
-
-        try:
-            data = response.json()
-        except ValueError as e:
-            logger.error(f'Failed to parse extension attributes response as JSON: {e}')
-            raise Exception('Invalid JSON response from extension attributes endpoint')
-
-        if not isinstance(data, dict):
-            logger.error(f'Unexpected response format for extension attributes: expected dict, got {type(data).__name__}')
-            raise Exception('Invalid extension attributes response format')
-
-        results = data.get('results', [])
-        logger.debug(f'Retrieved {len(results)} extension attribute(s)')
-        return results
-    except requests.Timeout:
-        logger.error(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching extension attributes')
-        raise
-    except requests.RequestException as e:
-        logger.error(f'Network error fetching extension attributes: {e}')
-        raise
-
-
-def get_scripts(instance_url, token):
-    logger.debug('Fetching scripts')
-    try:
-        response = requests.get(
-            f'{instance_url}/api/v1/scripts',
-            headers={'Authorization': f'Bearer {token}'},
-            timeout=REQUEST_TIMEOUT
-        )
-
-        if response.status_code != 200:
-            logger.error(f'Failed to fetch scripts: {response.status_code}')
-            logger.debug(f'Response body: {response.text[:500]}')  # Log only first 500 chars
-            raise Exception(f'Failed to fetch scripts: {response.status_code}')
-
-        try:
-            data = response.json()
-        except ValueError as e:
-            logger.error(f'Failed to parse scripts response as JSON: {e}')
-            raise Exception('Invalid JSON response from scripts endpoint')
-
-        if not isinstance(data, dict):
-            logger.error(f'Unexpected response format for scripts: expected dict, got {type(data).__name__}')
-            raise Exception('Invalid scripts response format')
-
-        results = data.get('results', [])
-        logger.debug(f'Retrieved {len(results)} script(s)')
-        return results
-    except requests.Timeout:
-        logger.error(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching scripts')
-        raise
-    except requests.RequestException as e:
-        logger.error(f'Network error fetching scripts: {e}')
-        raise
-
-
-def get_extension_attribute_details(instance_url, token, ea_id):
-    logger.debug(f'Fetching details for extension attribute ID: {ea_id}')
-    try:
-        response = requests.get(
-            f'{instance_url}/api/v1/computer-extension-attributes/{ea_id}',
-            headers={'Authorization': f'Bearer {token}'},
-            timeout=REQUEST_TIMEOUT
-        )
-
-        if response.status_code != 200:
-            logger.warning(f'Failed to fetch extension attribute {ea_id} details: {response.status_code}')
+            error_msg = f'API returned status {response.status_code}'
+            logger.warning(f'Failed to fetch {resource_name} {resource_id} details: {error_msg}')
+            failure_tracker.add_failure(resource_name, resource_id, resource_name, error_msg)
             return None
 
         try:
             data = response.json()
         except ValueError as e:
-            logger.warning(f'Failed to parse extension attribute {ea_id} details as JSON: {e}')
+            error_msg = f'Invalid JSON response: {str(e)}'
+            logger.warning(f'Failed to parse {resource_name} {resource_id} details: {error_msg}')
+            failure_tracker.add_failure(resource_name, resource_id, resource_name, error_msg)
             return None
 
         return data
+
     except requests.Timeout:
-        logger.warning(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching extension attribute {ea_id} details')
+        error_msg = f'Request timed out after {REQUEST_TIMEOUT} seconds'
+        logger.warning(f'Timeout fetching {resource_name} {resource_id} details')
+        failure_tracker.add_failure(resource_name, resource_id, resource_name, error_msg)
         return None
     except requests.RequestException as e:
-        logger.warning(f'Network error fetching extension attribute {ea_id} details: {e}')
-        return None
-
-
-def get_script_details(instance_url, token, script_id):
-    logger.debug(f'Fetching details for script ID: {script_id}')
-    try:
-        response = requests.get(
-            f'{instance_url}/api/v1/scripts/{script_id}',
-            headers={'Authorization': f'Bearer {token}'},
-            timeout=REQUEST_TIMEOUT
-        )
-
-        if response.status_code != 200:
-            logger.warning(f'Failed to fetch script {script_id} details: {response.status_code}')
-            return None
-
-        try:
-            data = response.json()
-        except ValueError as e:
-            logger.warning(f'Failed to parse script {script_id} details as JSON: {e}')
-            return None
-
-        return data
-    except requests.Timeout:
-        logger.warning(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching script {script_id} details')
-        return None
-    except requests.RequestException as e:
-        logger.warning(f'Network error fetching script {script_id} details: {e}')
+        error_msg = f'Network error: {str(e)}'
+        logger.warning(f'Network error fetching {resource_name} {resource_id} details: {e}')
+        failure_tracker.add_failure(resource_name, resource_id, resource_name, error_msg)
         return None
 
 
@@ -362,173 +318,60 @@ def extract_scope_groups(scope_data):
     return group_ids
 
 
-def write_idp_imports(idps, output_file='idp_imports.tf'):
-    if not idps:
-        logger.info('No cloud identity providers to export')
+def write_resource_imports(resources: List[Dict], config: Dict, group_map: Optional[Dict] = None,
+                         instance_url: Optional[str] = None, token: Optional[str] = None,
+                         failure_tracker: Optional[FailureTracker] = None) -> None:
+    """Generic function to write Terraform import blocks for resources"""
+    if not resources:
+        logger.info(f'No {config["display_name"]}s to export')
         return
 
-    logger.debug(f'Writing {len(idps)} cloud identity provider import blocks to {output_file}')
+    output_file = config['output_file']
+    logger.debug(f'Writing {len(resources)} {config["display_name"]} import blocks to {output_file}')
+
     try:
         with open(output_file, 'w') as f:
-            f.write('# Jamf Pro Cloud Identity Provider Import Blocks\n')
+            f.write(f'# {config["header"]}\n')
             f.write('# Run: terraform plan -generate-config-out=generated.tf\n\n')
 
-            for idp in idps:
-                idp_id = idp.get('id')
-                idp_name = idp.get('displayName', f'idp_{idp_id}')
-                resource_name = clean_name(idp_name)
+            for resource in resources:
+                resource_id = str(resource.get('id'))
+                resource_name = resource.get(config['name_field'], f'{config["display_name"]}_{resource_id}')
+                tf_resource_name = clean_name(resource_name)
 
-                logger.debug(f'Writing import block for IDP: {idp_name} (ID: {idp_id})')
-                f.write(f'import {{\n')
-                f.write(f'  to = jamfpro_cloud_identity_provider.{resource_name}\n')
-                f.write(f'  id = "{idp_id}"\n')
-                f.write(f'}}\n\n')
+                logger.debug(f'Processing {config["display_name"]}: {resource_name} (ID: {resource_id})')
 
-        logger.info(f'Wrote {len(idps)} import blocks to {output_file}')
-    except IOError as e:
-        logger.error(f'Failed to write to {output_file}: {e}')
-        raise
-
-
-def write_static_group_imports(groups, output_file='static_groups_imports.tf'):
-    if not groups:
-        logger.info('No static computer groups to export')
-        return
-
-    logger.debug(f'Writing {len(groups)} static computer group import blocks to {output_file}')
-    try:
-        with open(output_file, 'w') as f:
-            f.write('# Jamf Pro Static Computer Group Import Blocks\n')
-            f.write('# Run: terraform plan -generate-config-out=generated.tf\n\n')
-
-            for group in groups:
-                group_id = group.get('id')
-                group_name = group.get('name', f'group_{group_id}')
-                resource_name = clean_name(group_name)
-
-                logger.debug(f'Writing import block for static group: {group_name} (ID: {group_id})')
-                f.write(f'import {{\n')
-                f.write(f'  to = jamfpro_static_computer_group.{resource_name}\n')
-                f.write(f'  id = "{group_id}"\n')
-                f.write(f'}}\n\n')
-
-        logger.info(f'Wrote {len(groups)} import blocks to {output_file}')
-    except IOError as e:
-        logger.error(f'Failed to write to {output_file}: {e}')
-        raise
-
-
-def write_smart_group_imports(groups, output_file='smart_groups_imports.tf'):
-    if not groups:
-        logger.info('No smart computer groups to export')
-        return
-
-    logger.debug(f'Writing {len(groups)} smart computer group import blocks to {output_file}')
-    try:
-        with open(output_file, 'w') as f:
-            f.write('# Jamf Pro Smart Computer Group Import Blocks\n')
-            f.write('# Run: terraform plan -generate-config-out=generated.tf\n\n')
-
-            for group in groups:
-                group_id = group.get('id')
-                group_name = group.get('name', f'group_{group_id}')
-                resource_name = clean_name(group_name)
-
-                logger.debug(f'Writing import block for smart group: {group_name} (ID: {group_id})')
-                f.write(f'import {{\n')
-                f.write(f'  to = jamfpro_smart_computer_group.{resource_name}\n')
-                f.write(f'  id = "{group_id}"\n')
-                f.write(f'}}\n\n')
-
-        logger.info(f'Wrote {len(groups)} import blocks to {output_file}')
-    except IOError as e:
-        logger.error(f'Failed to write to {output_file}: {e}')
-        raise
-
-
-def write_extension_attribute_imports(eas, group_map, instance_url, token, output_file='extension_attributes_imports.tf'):
-    if not eas:
-        logger.info('No extension attributes to export')
-        return
-
-    logger.debug(f'Writing {len(eas)} extension attribute import blocks to {output_file}')
-    try:
-        with open(output_file, 'w') as f:
-            f.write('# Jamf Pro Computer Extension Attribute Import Blocks\n')
-            f.write('# Run: terraform plan -generate-config-out=generated.tf\n\n')
-
-            for ea in eas:
-                ea_id = ea.get('id')
-                ea_name = ea.get('name', f'ea_{ea_id}')
-                resource_name = clean_name(ea_name)
-
-                logger.debug(f'Processing extension attribute: {ea_name} (ID: {ea_id})')
-                details = get_extension_attribute_details(instance_url, token, ea_id)
                 scope_groups = []
+                if config.get('has_scope') and instance_url and token and failure_tracker:
+                    details = fetch_resource_details(
+                        instance_url, token,
+                        config['details_endpoint'],
+                        resource_id,
+                        f'{config["display_name"]} {resource_name}',
+                        failure_tracker
+                    )
 
-                if details and 'inventoryDisplay' in details:
-                    scope_groups = extract_scope_groups(details.get('inventoryDisplay'))
-                    if scope_groups:
-                        logger.debug(f'Extension attribute {ea_name} has {len(scope_groups)} scope group(s)')
+                    if details:
+                        scope_path = config.get('scope_path')
+                        scope_data = details.get(scope_path) if scope_path else details
+                        scope_groups = extract_scope_groups(scope_data)
+                        if scope_groups:
+                            logger.debug(f'{config["display_name"]} {resource_name} has {len(scope_groups)} scope group(s)')
 
-                if scope_groups:
-                    f.write(f'# Scoped to groups: ')
+                if scope_groups and group_map:
                     group_names = []
                     for gid in scope_groups:
                         if gid in group_map:
                             group_names.append(f"{group_map[gid]['name']} ({group_map[gid]['type']})")
-                    f.write(', '.join(group_names) + '\n')
+                    if group_names:
+                        f.write(f'# Scoped to groups: {", ".join(group_names)}\n')
 
                 f.write(f'import {{\n')
-                f.write(f'  to = jamfpro_computer_extension_attribute.{resource_name}\n')
-                f.write(f'  id = "{ea_id}"\n')
+                f.write(f'  to = {config["terraform_resource"]}.{tf_resource_name}\n')
+                f.write(f'  id = "{resource_id}"\n')
                 f.write(f'}}\n\n')
 
-        logger.info(f'Wrote {len(eas)} import blocks to {output_file}')
-    except IOError as e:
-        logger.error(f'Failed to write to {output_file}: {e}')
-        raise
-
-
-def write_script_imports(scripts, group_map, instance_url, token, output_file='scripts_imports.tf'):
-    if not scripts:
-        logger.info('No scripts to export')
-        return
-
-    logger.debug(f'Writing {len(scripts)} script import blocks to {output_file}')
-    try:
-        with open(output_file, 'w') as f:
-            f.write('# Jamf Pro Script Import Blocks\n')
-            f.write('# Run: terraform plan -generate-config-out=generated.tf\n\n')
-
-            for script in scripts:
-                script_id = script.get('id')
-                script_name = script.get('name', f'script_{script_id}')
-                resource_name = clean_name(script_name)
-
-                logger.debug(f'Processing script: {script_name} (ID: {script_id})')
-                details = get_script_details(instance_url, token, script_id)
-                scope_groups = []
-
-                if details:
-                    scope_groups = extract_scope_groups(details)
-                    if scope_groups:
-                        logger.debug(f'Script {script_name} has {len(scope_groups)} scope group(s)')
-
-                if scope_groups:
-                    f.write(f'# Scoped to groups: ')
-                    group_names = []
-                    for gid in scope_groups:
-                        if gid in group_map:
-                            group_names.append(f"{group_map[gid]['name']} ({group_map[gid]['type']})")
-                    f.write(', '.join(group_names) + '\n')
-
-                f.write(f'import {{\n')
-                f.write(f'  to = jamfpro_script.{resource_name}\n')
-                f.write(f'  id = "{script_id}"\n')
-                f.write(f'}}\n\n')
-
-        logger.info(f'Wrote {len(scripts)} import blocks to {output_file}')
+        logger.info(f'Wrote {len(resources)} import blocks to {output_file}')
     except IOError as e:
         logger.error(f'Failed to write to {output_file}: {e}')
         raise
@@ -577,6 +420,8 @@ def main():
     logger.info(f'Starting Jamf Pro export to Terraform')
     logger.debug(f'Target instance: {instance_url}')
 
+    failure_tracker = FailureTracker()
+
     try:
         logger.info(f'Connecting to {instance_url}...')
         token = get_jamf_token(instance_url, client_id, client_secret)
@@ -585,47 +430,80 @@ def main():
         smart_groups = []
         group_map = {}
 
-        if args.all or args.static_groups or args.extension_attributes or args.scripts:
-            logger.info('Fetching static computer groups...')
-            static_groups = get_static_computer_groups(instance_url, token)
-            logger.info(f'Found {len(static_groups)} static group(s)')
+        needs_groups = args.all or args.static_groups or args.smart_groups or args.extension_attributes or args.scripts
 
-        if args.all or args.smart_groups or args.extension_attributes or args.scripts:
-            logger.info('Fetching smart computer groups...')
-            smart_groups = get_smart_computer_groups(instance_url, token)
-            logger.info(f'Found {len(smart_groups)} smart group(s)')
+        if needs_groups:
+            logger.info('Fetching computer groups...')
 
-        if static_groups or smart_groups:
-            logger.debug('Building group map for scope resolution')
-            group_map = build_group_map(static_groups, smart_groups)
-            logger.debug(f'Group map contains {len(group_map)} entries')
+            if args.all or args.static_groups or args.extension_attributes or args.scripts:
+                static_groups = fetch_api_resources(
+                    instance_url, token,
+                    RESOURCE_CONFIGS['static_groups']['endpoint'],
+                    RESOURCE_CONFIGS['static_groups']['display_name']
+                )
+                logger.info(f'Found {len(static_groups)} static group(s)')
+
+            if args.all or args.smart_groups or args.extension_attributes or args.scripts:
+                smart_groups = fetch_api_resources(
+                    instance_url, token,
+                    RESOURCE_CONFIGS['smart_groups']['endpoint'],
+                    RESOURCE_CONFIGS['smart_groups']['display_name']
+                )
+                logger.info(f'Found {len(smart_groups)} smart group(s)')
+
+            if static_groups or smart_groups:
+                logger.debug('Building group map for scope resolution')
+                group_map = build_group_map(static_groups, smart_groups)
+                logger.debug(f'Group map contains {len(group_map)} entries')
 
         if args.all or args.idp:
             logger.info('Fetching cloud identity providers...')
-            idps = get_cloud_idps(instance_url, token)
+            idps = fetch_api_resources(
+                instance_url, token,
+                RESOURCE_CONFIGS['cloud_idp']['endpoint'],
+                RESOURCE_CONFIGS['cloud_idp']['display_name']
+            )
             logger.info(f'Found {len(idps)} cloud identity provider(s)')
-            write_idp_imports(idps)
+            write_resource_imports(idps, RESOURCE_CONFIGS['cloud_idp'])
 
         if args.all or args.static_groups:
-            write_static_group_imports(static_groups)
+            write_resource_imports(static_groups, RESOURCE_CONFIGS['static_groups'])
 
         if args.all or args.smart_groups:
-            write_smart_group_imports(smart_groups)
+            write_resource_imports(smart_groups, RESOURCE_CONFIGS['smart_groups'])
 
         if args.all or args.extension_attributes:
             logger.info('Fetching extension attributes...')
-            eas = get_extension_attributes(instance_url, token)
+            eas = fetch_api_resources(
+                instance_url, token,
+                RESOURCE_CONFIGS['extension_attributes']['endpoint'],
+                RESOURCE_CONFIGS['extension_attributes']['display_name']
+            )
             logger.info(f'Found {len(eas)} extension attribute(s)')
-            write_extension_attribute_imports(eas, group_map, instance_url, token)
+            write_resource_imports(
+                eas, RESOURCE_CONFIGS['extension_attributes'],
+                group_map, instance_url, token, failure_tracker
+            )
 
         if args.all or args.scripts:
             logger.info('Fetching scripts...')
-            scripts = get_scripts(instance_url, token)
+            scripts = fetch_api_resources(
+                instance_url, token,
+                RESOURCE_CONFIGS['scripts']['endpoint'],
+                RESOURCE_CONFIGS['scripts']['display_name']
+            )
             logger.info(f'Found {len(scripts)} script(s)')
-            write_script_imports(scripts, group_map, instance_url, token)
+            write_resource_imports(
+                scripts, RESOURCE_CONFIGS['scripts'],
+                group_map, instance_url, token, failure_tracker
+            )
 
         logger.info('\nExport completed successfully')
-        logger.info('Next steps:')
+
+        if failure_tracker.has_failures():
+            logger.warning(failure_tracker.get_summary())
+
+        logger.info('\nNext steps:')
         logger.info('1. terraform init')
         logger.info('2. terraform plan -generate-config-out=generated.tf')
 
