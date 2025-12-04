@@ -8,6 +8,9 @@ import sys
 
 import requests
 
+# Request timeout in seconds
+REQUEST_TIMEOUT = 30
+
 
 def setup_logger(log_file='jamf_export.log', console_level=logging.INFO, file_level=logging.DEBUG):
     logger = logging.getLogger('jamf_exporter')
@@ -48,7 +51,8 @@ def get_jamf_token(instance_url, client_id, client_secret):
                 'client_secret': client_secret,
                 'grant_type': 'client_credentials'
             },
-            headers={'Content-Type': 'application/x-www-form-urlencoded'}
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            timeout=REQUEST_TIMEOUT
         )
 
         if response.status_code != 200:
@@ -58,6 +62,9 @@ def get_jamf_token(instance_url, client_id, client_secret):
 
         logger.info('Successfully authenticated to Jamf Pro')
         return response.json()['access_token']
+    except requests.Timeout:
+        logger.error(f'Authentication request timed out after {REQUEST_TIMEOUT} seconds')
+        raise
     except requests.RequestException as e:
         logger.error(f'Network error during authentication: {e}')
         raise
@@ -68,7 +75,8 @@ def get_cloud_idps(instance_url, token):
     try:
         response = requests.get(
             f'{instance_url}/api/v1/cloud-idp',
-            headers={'Authorization': f'Bearer {token}'}
+            headers={'Authorization': f'Bearer {token}'},
+            timeout=REQUEST_TIMEOUT
         )
 
         if response.status_code != 200:
@@ -79,6 +87,9 @@ def get_cloud_idps(instance_url, token):
         results = response.json().get('results', [])
         logger.debug(f'Retrieved {len(results)} cloud identity provider(s)')
         return results
+    except requests.Timeout:
+        logger.error(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching cloud IDPs')
+        raise
     except requests.RequestException as e:
         logger.error(f'Network error fetching cloud IDPs: {e}')
         raise
@@ -89,7 +100,8 @@ def get_static_computer_groups(instance_url, token):
     try:
         response = requests.get(
             f'{instance_url}/api/v2/computer-groups/static-groups',
-            headers={'Authorization': f'Bearer {token}'}
+            headers={'Authorization': f'Bearer {token}'},
+            timeout=REQUEST_TIMEOUT
         )
 
         if response.status_code != 200:
@@ -100,6 +112,9 @@ def get_static_computer_groups(instance_url, token):
         results = response.json().get('results', [])
         logger.debug(f'Retrieved {len(results)} static computer group(s)')
         return results
+    except requests.Timeout:
+        logger.error(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching static computer groups')
+        raise
     except requests.RequestException as e:
         logger.error(f'Network error fetching static computer groups: {e}')
         raise
@@ -110,7 +125,8 @@ def get_smart_computer_groups(instance_url, token):
     try:
         response = requests.get(
             f'{instance_url}/api/v2/computer-groups/smart-groups',
-            headers={'Authorization': f'Bearer {token}'}
+            headers={'Authorization': f'Bearer {token}'},
+            timeout=REQUEST_TIMEOUT
         )
 
         if response.status_code != 200:
@@ -121,6 +137,9 @@ def get_smart_computer_groups(instance_url, token):
         results = response.json().get('results', [])
         logger.debug(f'Retrieved {len(results)} smart computer group(s)')
         return results
+    except requests.Timeout:
+        logger.error(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching smart computer groups')
+        raise
     except requests.RequestException as e:
         logger.error(f'Network error fetching smart computer groups: {e}')
         raise
@@ -131,7 +150,8 @@ def get_extension_attributes(instance_url, token):
     try:
         response = requests.get(
             f'{instance_url}/api/v1/computer-extension-attributes',
-            headers={'Authorization': f'Bearer {token}'}
+            headers={'Authorization': f'Bearer {token}'},
+            timeout=REQUEST_TIMEOUT
         )
 
         if response.status_code != 200:
@@ -142,6 +162,9 @@ def get_extension_attributes(instance_url, token):
         results = response.json().get('results', [])
         logger.debug(f'Retrieved {len(results)} extension attribute(s)')
         return results
+    except requests.Timeout:
+        logger.error(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching extension attributes')
+        raise
     except requests.RequestException as e:
         logger.error(f'Network error fetching extension attributes: {e}')
         raise
@@ -152,7 +175,8 @@ def get_scripts(instance_url, token):
     try:
         response = requests.get(
             f'{instance_url}/api/v1/scripts',
-            headers={'Authorization': f'Bearer {token}'}
+            headers={'Authorization': f'Bearer {token}'},
+            timeout=REQUEST_TIMEOUT
         )
 
         if response.status_code != 200:
@@ -163,6 +187,9 @@ def get_scripts(instance_url, token):
         results = response.json().get('results', [])
         logger.debug(f'Retrieved {len(results)} script(s)')
         return results
+    except requests.Timeout:
+        logger.error(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching scripts')
+        raise
     except requests.RequestException as e:
         logger.error(f'Network error fetching scripts: {e}')
         raise
@@ -173,7 +200,8 @@ def get_extension_attribute_details(instance_url, token, ea_id):
     try:
         response = requests.get(
             f'{instance_url}/api/v1/computer-extension-attributes/{ea_id}',
-            headers={'Authorization': f'Bearer {token}'}
+            headers={'Authorization': f'Bearer {token}'},
+            timeout=REQUEST_TIMEOUT
         )
 
         if response.status_code != 200:
@@ -181,6 +209,9 @@ def get_extension_attribute_details(instance_url, token, ea_id):
             return None
 
         return response.json()
+    except requests.Timeout:
+        logger.warning(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching extension attribute {ea_id} details')
+        return None
     except requests.RequestException as e:
         logger.warning(f'Network error fetching extension attribute {ea_id} details: {e}')
         return None
@@ -191,7 +222,8 @@ def get_script_details(instance_url, token, script_id):
     try:
         response = requests.get(
             f'{instance_url}/api/v1/scripts/{script_id}',
-            headers={'Authorization': f'Bearer {token}'}
+            headers={'Authorization': f'Bearer {token}'},
+            timeout=REQUEST_TIMEOUT
         )
 
         if response.status_code != 200:
@@ -199,6 +231,9 @@ def get_script_details(instance_url, token, script_id):
             return None
 
         return response.json()
+    except requests.Timeout:
+        logger.warning(f'Request timed out after {REQUEST_TIMEOUT} seconds while fetching script {script_id} details')
+        return None
     except requests.RequestException as e:
         logger.warning(f'Network error fetching script {script_id} details: {e}')
         return None
