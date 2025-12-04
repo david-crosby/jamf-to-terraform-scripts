@@ -158,7 +158,8 @@ def get_jamf_token(instance_url: str, client_id: str, client_secret: str) -> str
                 'grant_type': 'client_credentials'
             },
             headers={'Content-Type': 'application/x-www-form-urlencoded'},
-            timeout=REQUEST_TIMEOUT
+            timeout=REQUEST_TIMEOUT,
+            verify=True
         )
 
         if response.status_code != 200:
@@ -195,7 +196,8 @@ def fetch_api_resources(instance_url: str, token: str, endpoint: str, resource_n
         response = requests.get(
             f'{instance_url}/{endpoint}',
             headers={'Authorization': f'Bearer {token}'},
-            timeout=REQUEST_TIMEOUT
+            timeout=REQUEST_TIMEOUT,
+            verify=True
         )
 
         if response.status_code != 200:
@@ -226,7 +228,7 @@ def fetch_api_resources(instance_url: str, token: str, endpoint: str, resource_n
 
 
 def fetch_resource_details(instance_url: str, token: str, endpoint: str, resource_id: str,
-                          resource_name: str, failure_tracker: FailureTracker) -> Optional[Dict]:
+                          resource_name: str, resource_type: str, failure_tracker: FailureTracker) -> Optional[Dict]:
     """Generic function to fetch individual resource details with failure tracking"""
     logger.debug(f'Fetching details for {resource_name} ID: {resource_id}')
 
@@ -236,13 +238,14 @@ def fetch_resource_details(instance_url: str, token: str, endpoint: str, resourc
         response = requests.get(
             f'{instance_url}/{endpoint.format(id=resource_id)}',
             headers={'Authorization': f'Bearer {token}'},
-            timeout=REQUEST_TIMEOUT
+            timeout=REQUEST_TIMEOUT,
+            verify=True
         )
 
         if response.status_code != 200:
             error_msg = f'API returned status {response.status_code}'
             logger.warning(f'Failed to fetch {resource_name} {resource_id} details: {error_msg}')
-            failure_tracker.add_failure(resource_name, resource_id, resource_name, error_msg)
+            failure_tracker.add_failure(resource_type, resource_id, resource_name, error_msg)
             return None
 
         try:
@@ -250,7 +253,7 @@ def fetch_resource_details(instance_url: str, token: str, endpoint: str, resourc
         except ValueError as e:
             error_msg = f'Invalid JSON response: {str(e)}'
             logger.warning(f'Failed to parse {resource_name} {resource_id} details: {error_msg}')
-            failure_tracker.add_failure(resource_name, resource_id, resource_name, error_msg)
+            failure_tracker.add_failure(resource_type, resource_id, resource_name, error_msg)
             return None
 
         return data
@@ -258,16 +261,16 @@ def fetch_resource_details(instance_url: str, token: str, endpoint: str, resourc
     except requests.Timeout:
         error_msg = f'Request timed out after {REQUEST_TIMEOUT} seconds'
         logger.warning(f'Timeout fetching {resource_name} {resource_id} details')
-        failure_tracker.add_failure(resource_name, resource_id, resource_name, error_msg)
+        failure_tracker.add_failure(resource_type, resource_id, resource_name, error_msg)
         return None
     except requests.RequestException as e:
         error_msg = f'Network error: {str(e)}'
         logger.warning(f'Network error fetching {resource_name} {resource_id} details: {e}')
-        failure_tracker.add_failure(resource_name, resource_id, resource_name, error_msg)
+        failure_tracker.add_failure(resource_type, resource_id, resource_name, error_msg)
         return None
 
 
-def clean_name(name):
+def clean_name(name: str, resource_id: Optional[str] = None) -> str:
     cleaned = name.lower()
     cleaned = re.sub(r'[^a-z0-9_]', '_', cleaned)
     cleaned = re.sub(r'_+', '_', cleaned)
@@ -276,7 +279,10 @@ def clean_name(name):
     if cleaned and cleaned[0].isdigit():
         cleaned = f'resource_{cleaned}'
 
-    return cleaned if cleaned else 'unnamed'
+    if not cleaned:
+        return f'unnamed_{resource_id}' if resource_id else 'unnamed'
+
+    return cleaned
 
 
 def build_group_map(static_groups, smart_groups):
@@ -337,7 +343,7 @@ def write_resource_imports(resources: List[Dict], config: Dict, group_map: Optio
             for resource in resources:
                 resource_id = str(resource.get('id'))
                 resource_name = resource.get(config['name_field'], f'{config["display_name"]}_{resource_id}')
-                tf_resource_name = clean_name(resource_name)
+                tf_resource_name = clean_name(resource_name, resource_id)
 
                 logger.debug(f'Processing {config["display_name"]}: {resource_name} (ID: {resource_id})')
 
@@ -347,7 +353,8 @@ def write_resource_imports(resources: List[Dict], config: Dict, group_map: Optio
                         instance_url, token,
                         config['details_endpoint'],
                         resource_id,
-                        f'{config["display_name"]} {resource_name}',
+                        resource_name,
+                        config['display_name'],
                         failure_tracker
                     )
 
